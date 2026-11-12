@@ -1,0 +1,21 @@
+# 忽略大文件与临时产物
+*.bin
+*.ubi
+*.zip
+*.log
+*.txt.tmp
+
+# 抓包/日志
+uart_*.log
+*_capture.log
+catch*.log
+abort*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 系统
+.DS_Store
+Thumbs.db
