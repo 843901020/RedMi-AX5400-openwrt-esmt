@@ -1,33 +1,48 @@
-# 红米 AX5400 (RA74 / IPQ5018) 刷 OpenWrt 踩坑全记录
+# 红米 AX5400 (RA74 / IPQ5018) 刷 OpenWrt 全记录
 
-> 一台"无限重启的砖"，如何在**不重新编译固件**的前提下装上 OpenWrt。
+> 从"无限重启的砖"到"跑着 OpenWrt + LuCI 的可用路由器"的完整过程。
 >
 > **核心发现：同一个型号的 AX5400 用了两种不同的 NAND 芯片。**
-> OpenWrt 的设备树把 `nand-ecc-strength` 硬编码成 `<8>`，只适配其中一种（OOB 128 的
-> GigaDevice），另一种（OOB 64 的 ESMT）装上去必然变砖 —— 而且 `sysupgrade` 会**报告成功**。
+> OpenWrt 的设备树把 `nand-ecc-strength` 硬编码成 `<8>`，只适配 OOB 128 的 GigaDevice，
+> 另一种 OOB 64 的 ESMT 装上去必然变砖 —— 而且 `sysupgrade` 会**报告成功**。
 >
-> 本文给出：完整的根因分析、三组对照实验、以及一套**二进制打补丁**的解法。
+> 本文给出：完整根因分析、三组对照实验、**不用编译的二进制打补丁方案**、
+> 以及从零到 LuCI 可用的**全流程操作步骤**和**踩坑清单**。
 
 ---
 
 ## 目录
 
-- [1. 现象：无限重启](#1-现象无限重启)
-- [2. 关键发现：两种 NAND 芯片](#2-关键发现两种-nand-芯片)
-- [3. 为什么两种芯片会导致完全不同的结果](#3-为什么两种芯片会导致完全不同的结果)
-- [4. 三组对照实验（决定性证据）](#4-三组对照实验决定性证据)
-- [5. 为什么 sysupgrade 会"假成功"](#5-为什么-sysupgrade-会假成功)
-- [6. 解法：不编译，直接改固件二进制](#6-解法不编译直接改固件二进制)
-- [7. 完整刷机流程](#7-完整刷机流程)
-- [8. 救砖兜底：官方恢复模式](#8-救砖兜底官方恢复模式)
-- [9. 没有 WAN 口时如何装软件包](#9-没有-wan-口时如何装软件包)
+- [1. 最终成果](#1-最终成果)
+- [2. 现象：无限重启](#2-现象无限重启)
+- [3. 关键发现：两种 NAND 芯片](#3-关键发现两种-nand-芯片)
+- [4. 为什么两种芯片结果完全不同](#4-为什么两种芯片结果完全不同)
+- [5. 三组对照实验（决定性证据）](#5-三组对照实验决定性证据)
+- [6. 为什么 sysupgrade 会"假成功"](#6-为什么-sysupgrade-会假成功)
+- [7. 解法：不编译，直接改固件二进制](#7-解法不编译直接改固件二进制)
+- [8. 完整刷机流程（从砖到 OpenWrt + LuCI）](#8-完整刷机流程从砖到-openwrt--luci)
+- [9. 救砖兜底：官方恢复模式](#9-救砖兜底官方恢复模式)
 - [10. 分区表（附一个致命陷阱）](#10-分区表附一个致命陷阱)
-- [11. 工具清单](#11-工具清单)
-- [12. 常见问题](#12-常见问题)
+- [11. 踩坑清单（速查）](#11-踩坑清单速查)
+- [12. 工具清单](#12-工具清单)
+- [13. 常见问题](#13-常见问题)
 
 ---
 
-## 1. 现象：无限重启
+## 1. 最终成果
+
+```
+OpenWrt SNAPSHOT r38209-ada52cc7ed
+kernel 6.18.60 · squashfs + overlay 60.4MB
+192.168.1.1 · SSH root/root · LuCI 正常
+WiFi: OpenWrt (2.4G ch1 HE20) / OpenWrt (5G ch36 HE80)
+```
+
+硬件：Redmi AX5400 (RA74 / IPQ5018 / ESMT F50D1G41LB / OOB 64)
+
+---
+
+## 2. 现象：无限重启
 
 串口（115200 8N1，板载 TTL）看到：
 
@@ -58,9 +73,9 @@ resetting ...
 
 ---
 
-## 2. 关键发现：两种 NAND 芯片
+## 3. 关键发现：两种 NAND 芯片
 
-### 2.1 怎么发现的
+### 3.1 怎么发现的
 
 一开始我把问题归因为"OpenWrt 固件有 bug"，试了三个不同构建、重刷了十几次，
 每次都卡在同一个地方：`ubi0: attaching mtd18` 报 ECC 错误。
@@ -68,7 +83,7 @@ resetting ...
 转折点是：**手上有另一台能正常跑 OpenWrt 的同型号 RA74**。
 把两台的关键信息一对比，发现了决定性差异 —— **NAND 芯片根本不一样。**
 
-### 2.2 两台机器的对照
+### 3.2 两台机器的对照
 
 | | **故障机** | **正常机** |
 |---|---|---|
@@ -80,25 +95,17 @@ resetting ...
 | **NAND 型号** | **F50D1G41LB(2M)** | （未打印具体型号） |
 | **OOB / Spare** | **64 字节** | **128 字节** |
 | U-Boot 报的 ECC | `ECC: 4-bit` | （未打印） |
-| 容量 | 128 MiB | 128 MiB |
-| 页大小 | 2048 | 2048 |
-| 块大小 | 128 KiB | 128 KiB |
+| 容量 / 页 / 块 | 128 MiB / 2048 / 128 KiB | 128 MiB / 2048 / 128 KiB |
 
-### 2.3 原始日志（U-Boot 侧）
+### 3.3 原始日志（U-Boot 侧）
 
 **故障机：**
 
 ```
 NAND:  QPIC controller support serial NAND
-ID = 7f7f11c8
-Vendor = c8
-Device = 11
-Serial Nand Device Found With ID : 0xc8 0x11
 Serial NAND device Manufature:F50D1G41LB(2M)
 Device Size:128 MiB, Page size:2048, Spare Size:64, ECC:4-bit
 ESMT F50D1G41LB(2M), disable serial training.
-Error in serial training.
-switch back to 50MHz with feed back clock bit enabled
 ```
 
 注意 `Spare Size:64` 和 `ECC:4-bit`。
@@ -108,13 +115,11 @@ switch back to 50MHz with feed back clock bit enabled
 ```
 spi-nand spi0.0: GigaDevice SPI NAND was found.
 spi-nand spi0.0: 128 MiB, block size: 128 KiB, page size: 2048, OOB size: 128
-qcom_snand 79b0000.spi: Warning: due to hw limitation, the reported number of
-                         the corrected bits may be inaccurate
 ```
 
 注意 `OOB size: 128`。
 
-### 2.4 原始日志（内核侧）
+### 3.4 原始日志（内核侧）
 
 **故障机跑 OpenWrt 时：**
 
@@ -123,17 +128,15 @@ spi-nand spi0.0: ESMT SPI NAND was found.
 spi-nand spi0.0: 128 MiB, block size: 128 KiB, page size: 2048, OOB size: 64
 [    2.841797] ubi0 warning: ubi_io_read: error -74 (ECC error) while reading
                           64 bytes from PEB 0:0, read only 64 bytes, retry
-[    2.878146] ubi0 warning: ubi_io_read: error -74 (ECC error) while reading
-                          64 bytes from PEB 0:2048, read only 64 bytes, retry
 ```
 
 芯片识别是对的（OOB 64），但 **ECC 强度来自设备树（8-bit）**，于是读写全错。
 
 ---
 
-## 3. 为什么两种芯片会导致完全不同的结果
+## 4. 为什么两种芯片结果完全不同
 
-### 3.1 OOB 决定 ECC 上限
+### 4.1 OOB 决定 ECC 上限
 
 OOB（Out-Of-Band，也叫 Spare Area）是每页旁边那块额外空间，专门放 ECC 校验码。
 
@@ -145,11 +148,11 @@ OOB（Out-Of-Band，也叫 Spare Area）是每页旁边那块额外空间，专�
 | 8-bit | 14 B | 8 × 14 = **112 B** | ❌ 放不下 | ✅ |
 | 12-bit | 21 B | 8 × 21 = 168 B | ❌ | ❌ |
 
-**结论：OOB 64 的芯片最多只能上 4-bit ECC，8-bit 的校验码放不下。**
+**结论：OOB 64 的芯片最多只能上 4-bit ECC。**
 
-### 3.2 而 OpenWrt 写死了 8-bit
+### 4.2 而 OpenWrt 写死了 8-bit
 
-从 `squashfs-sysupgrade.bin` 的 `kernel`（FIT）里解析出的内嵌 DTB：
+从固件的 `kernel`（FIT）里解析出的内嵌 DTB：
 
 ```
 /soc@0/spi@79b0000
@@ -162,13 +165,13 @@ OOB（Out-Of-Band，也叫 Spare Area）是每页旁边那块额外空间，专�
     nand-ecc-strength   = 8        ← 问题所在，写死的
 ```
 
-### 3.3 于是两台机器的命运完全不同
+### 4.3 两台机器的命运
 
 **正常机（GigaDevice / OOB 128）：**
 
 ```
-OpenWrt 用 8-bit 写 → 校验码 112 B ≤ 128 B OOB   ✅ 放得下
-U-Boot 读          → 芯片工作在 8-bit 模式        ✅ 读得出来
+OpenWrt 用 8-bit 写 → 校验码 112 B ≤ 128 B OOB   ✅
+U-Boot 读          → 芯片工作在 8-bit 模式        ✅
 ```
 
 **故障机（ESMT / OOB 64）：**
@@ -178,16 +181,14 @@ OpenWrt 用 8-bit 写 → 校验码 112 B > 64 B OOB    ❌ 放不下
                      ↓
                 写进去的数据结构是坏的
                      ↓
-U-Boot 用 4-bit 读 → ECC 校验失败                ❌ 读不出来
+U-Boot 用 4-bit 读 → ECC 校验失败                ❌ 读不出内核
                      ↓
-                读不出内核 → 无限重启
+                无限重启
 ```
 
 ---
 
-## 4. 三组对照实验（决定性证据）
-
-为了确认"是 ECC 强度不兼容"而不是别的，我做了三组交叉实验：
+## 5. 三组对照实验（决定性证据）
 
 | 谁写的 | 用的 ECC | U-Boot 能读 | OpenWrt 能读 |
 |---|---|---|---|
@@ -195,53 +196,21 @@ U-Boot 用 4-bit 读 → ECC 校验失败                ❌ 读不出来
 | **OpenWrt**（`sysupgrade`） | 8-bit | ❌ ECC error | ✅ |
 | **原厂内核**（`mtd write`） | 4-bit | ✅ | ✅ |
 
-### 这组数据的含义
+**含义：**
 
 1. **前两行互斥** —— U-Boot 和 OpenWrt 各写各的，互相读不了。这就是死结。
 2. **第三行两边通吃** —— 原厂内核和 U-Boot 都是 4-bit，所以它们之间没问题。
-3. 说明 **U-Boot 固定 4-bit**（跟着芯片自动选），而 **OpenWrt 固定 8-bit**（跟着 DTB）。
+3. 说明 **U-Boot 固定 4-bit**（跟着芯片自动选），**OpenWrt 固定 8-bit**（跟着 DTB）。
 
-### 具体实验过程
+**具体实验：**
 
-**实验一：U-Boot 写 → OpenWrt 读**
-
-用 U-Boot 把原厂 rootfs 写回 mtd18/mtd19，然后跑 OpenWrt initramfs：
-
-```
-ubi0: attaching mtd18
-ubi0 warning: ubi_io_read: error -74 (ECC error) while reading 64 bytes from PEB 0:0
-ubi0 error: ubi_io_read: error -74 (ECC error) ... read 64 bytes
-```
-→ **失败**，整个分区每个 PEB 都读不出来。
-
-**实验二：OpenWrt 写 → U-Boot 读**
-
-`sysupgrade` 报告 `successful`，卷都建好了，然后重启：
-
-```
-boot from rootfs 0
-miwifi: check crash in rmem !
-ubi0: attaching mtd1
-ECC 错误地址: 0xa80000 ~ 0x1500000      ← mtd18 开头 13MB 全读不了
-```
-→ **失败**，U-Boot 读不出内核。
-
-**实验三：原厂内核写 → 双方都能读**
-
-从原厂固件 SSH 进去，用 `mtd -e <分区> write <文件> <分区>` 写入：
-
-```
-U-Boot 读 → ✅ 正常启动
-OpenWrt 读 → ✅ 只报 image_seq 不匹配（那是残留数据问题，不是 ECC）
-```
-
-**这个实验直接证明了：只有原厂内核写的 4-bit 数据是两边通用的。**
+- **U-Boot 写 → OpenWrt 读**：整个分区每个 PEB 都 `error -74 (ECC error)`
+- **OpenWrt 写 → U-Boot 读**：`boot from rootfs 0` 后 ECC 错误地址铺满 `0xa80000 ~ 0x1500000`
+- **原厂内核写 → 双方都能读**：U-Boot 正常启动，OpenWrt 只报 `image_seq` 不匹配（残留数据问题，不是 ECC）
 
 ---
 
-## 5. 为什么 sysupgrade 会"假成功"
-
-这是最坑的地方。`sysupgrade` 的输出看起来完全正常：
+## 6. 为什么 sysupgrade 会"假成功"
 
 ```
 ubi0: attaching mtd18
@@ -250,7 +219,6 @@ ubi0: attached mtd18 (name "ubi_kernel", size 36 MiB)
 ubi1: attaching mtd19
 ubi1: empty MTD device detected
 ubi1: attached mtd19 (name "rootfs", size 81 MiB)
-Volume ID 127 ... name "provisioning"
 Volume ID 0, size 49 LEBs ... name "kernel"
 Volume ID 0, size 70 LEBs ... name "rootfs"
 Volume ID 1, size 556 LEBs ... name "rootfs_data"
@@ -264,87 +232,102 @@ sysupgrade successful
 因为 `sysupgrade` 用的是 initramfs 里的 **OpenWrt 内核**（8-bit ECC），
 而重启后负责读内核的是 **U-Boot**（4-bit ECC）。
 
-这是个"自己验自己"的陷阱：sysupgrade 用自己的内核写、用自己的内核验证，当然全过。
-真正要读它的是另一个程序（U-Boot），而那个程序读不了。
+**这是个"自己验自己"的陷阱**：写和验证用同一个内核，当然全过；
+真正要读它的是另一个程序，而那个程序读不了。
 
 ---
 
-## 6. 解法：不编译，直接改固件二进制
+## 7. 解法：不编译，直接改固件二进制
 
-### 6.1 思路
+### 7.1 思路
 
-既然问题出在 DTB 里的一个 u32 值（`8` → `4`），而它在固件镜像里就是个字节，
-那**直接改二进制**就行 —— 不需要 Linux 编译环境、不需要 30GB 磁盘、不需要等 3 小时编译。
+问题只是 DTB 里的一个 u32 值（`8` → `4`），它在固件镜像里就是个字节。
+**直接改二进制** —— 不需要 Linux 编译环境、不需要 30GB 磁盘、不需要等 3 小时。
 
-### 6.2 为什么可以原地改（关键技术点）
+### 7.2 为什么可以原地改
 
 | 结构 | 结论 |
 |---|---|
 | UBI **内核卷是动态卷**（`vol_type=1`） | `data_size` / `data_crc` 均为 0，**改数据区不需要重算 UBI CRC** |
 | UBI `hdr_crc` | 只覆盖 64 字节 VID 头，不动头就不用改 |
 | FIT 哈希节点 | `/images/fdt-1/hash-1`(crc32) + `hash-2`(sha1)，**必须重算** |
-| sysupgrade 尾部元数据 | 512 对齐后追加 281 字节 JSON（含 `FWx0` 魔数 + CRC + 长度），**重打包 tar 会丢** |
+| sysupgrade 尾部元数据 | 512 对齐后追加 281 字节 JSON（含 `FWx0` 魔数），**重打包 tar 会丢** |
 
-### 6.3 两个工具
+### 7.3 两个工具
 
 ```bash
 # 改 UBI 镜像里的内核 FIT（initramfs-factory.ubi 这类）
 python tools/_ubipatch.py <in.ubi> <out.ubi> 4
 
-# 改裸 FIT（如果直接拿到的是 FIT）
+# 改裸 FIT
 python tools/_fitpatch.py <in.bin> <out.bin> 4
 ```
 
-两者都会：找到 `flat_dt` 子镜像 → 把 `nand-ecc-strength` 改成 4 → 重算 crc32 + sha1 → 写回。
-**文件大小不变**，所以不影响任何偏移。
+两者都会：找 `flat_dt` 子镜像 → 改 `nand-ecc-strength` 为 4 → 重算 crc32 + sha1 → 写回。
+**文件大小不变**，不影响任何偏移。
 
-### 6.4 sysupgrade.bin 的特殊处理
+### 7.4 sysupgrade.bin 的特殊处理
 
-`sysupgrade.bin` 是 tar + 尾部元数据，**不能重新打包**（会丢元数据）：
+它是 tar + 尾部元数据，**不能重新打包**（会丢元数据）：
 
 ```python
 import tarfile
 d = bytearray(open(src, 'rb').read())
 m = [x for x in tarfile.open(src).getmembers() if x.name.endswith('/kernel')][0]
-d[m.offset_data:m.offset_data + m.size] = patched_kernel   # 等长覆写，其余字节不动
+d[m.offset_data:m.offset_data + m.size] = patched_kernel   # 等长覆写
 open(dst, 'wb').write(d)
 ```
 
 即使元数据完整，`sysupgrade` 仍可能误报 `Image metadata not present`，
-用 **`sysupgrade -n -F`** 强制刷入即可。
+用 **`sysupgrade -n -F`** 强制刷入。
 
-### 6.5 补丁效果
+### 7.5 补丁效果
 
 | 指标 | 补丁前 | 补丁后 |
 |---|---|---|
-| initramfs 启动时的 ECC 报错行数 | **906 行** | **0 行** |
+| initramfs 启动时 ECC 报错行数 | **906 行** | **0 行** |
 | `nand-ecc-strength` | 8 | 4 |
 | fdt crc32 | （旧值） | `0xc0eb1050` |
 | fdt sha1 | （旧值） | `8eef57820bf27220c4e1bddfcf84a4f974a96094` |
 
-**ECC 报错从 906 行降到 0 行** —— 这是补丁生效最直接的标志。
+补丁只改动 **25 个字节**（1 个 ECC 值 + 4 字节 crc32 + 20 字节 sha1）。
 
 ---
 
-## 7. 完整刷机流程
+## 8. 完整刷机流程（从砖到 OpenWrt + LuCI）
 
-### 7.1 准备两个补丁镜像
+### 8.1 准备
+
+**电脑侧：**
+
+- TTL 转 USB 接路由器（115200 8N1）
+- 网线接路由器 LAN 口
+- 以太网设静态 `192.168.31.100/24`（**不设网关**，否则抢默认路由导致断网）
+- 关掉防火墙（或放行 UDP 67/69、TCP 80/8000、ICMP）
+
+**镜像：**
 
 ```bash
 python tools/_ubipatch.py openwrt-...-initramfs-factory.ubi initramfs_p4.ubi 4
-# 再用 tarfile 原地覆写 sysupgrade 的 kernel -> sysupgrade_p4.bin
+# sysupgrade 用 tarfile 等长覆写内核 -> sysupgrade_p4.bin
 ```
 
-### 7.2 进入 U-Boot
+### 8.2 进 U-Boot
 
-- **`bootdelay` > 0**：直接连发回车即可中断（`tools/_uboot_stop.py`）
-- **`bootdelay` = 0**：**先按住 Reset，再插电源，按住 20 秒**
-  （U-Boot 检测到按键后还要**再确认 5 秒**，按 12 秒不够）
-  日志出现 `detect button pressed 5 secs !` 才算成功
+三种方式，按可用性选：
 
-> 如果进了恢复模式（`cmd=dhcp`）但想回 U-Boot 提示符，用 `tools/_abort.py` 连发 Ctrl-C。
+| 方式 | 条件 | 操作 |
+|---|---|---|
+| **敲键中断** | `bootdelay` > 0 | 连发回车（`tools/_uboot_stop.py`） |
+| **按住 Reset** | `bootdelay` = 0 | 按住 Reset → 插电 → **按 20 秒** → 松开 |
+| **从系统内设** | 系统能跑 | `fw_setenv bootdelay 5` 后重启 |
 
-### 7.3 刷入补丁版 initramfs
+> ⚠️ **按 12 秒不够！** U-Boot 检测到按键后还要**再确认 5 秒**，
+> 日志出现 `detect button pressed 5 secs !` 才算成功。
+>
+> 如果误进恢复模式（`cmd=dhcp`），用 `tools/_abort.py` 连发 Ctrl-C 抢回提示符。
+
+### 8.3 刷 initramfs —— **写到 mtd18（槽 0）**
 
 ```
 setenv ipaddr 192.168.31.1
@@ -352,78 +335,130 @@ setenv netmask 255.255.255.0
 setenv serverip 192.168.31.100
 tftpboot 0x44000000 initramfs_p4.ubi
 crc32 0x44000000 0xF80000
-nand erase 0x2E80000 0x2400000
-nand write 0x44000000 0x2E80000 0xF80000
+nand erase 0xA80000 0x2400000
+nand write 0x44000000 0xA80000 0xF80000
 reset
 ```
 
-电脑端跑 TFTP 服务器：`python tools/_tftp.py <目录>`
+> **⚠️ 为什么写 mtd18 而不是 mtd19？**
+>
+> `bootmiwifi` 每次启动会**重写 env 并翻转 `flag_boot_rootfs`**，
+> 手动设成 1 也会被覆盖回 0。
+> **写到槽 0（mtd18）就完全绕开了标志位问题** —— 不管标志是几都会启动它。
+>
+> 这是本次最关键的一个技巧，之前反复失败就是卡在这里。
 
-### 7.4 进 initramfs 后（关键）
+### 8.4 进 initramfs 后刷 sysupgrade
 
 ```sh
 mtd erase ubi_kernel      # mtd18
 mtd erase rootfs          # mtd19
-wget -O /tmp/fw.bin http://<PC_IP>:8000/sysupgrade_p4.bin
+wget -O /tmp/fw.bin http://192.168.31.100:8000/sysupgrade_p4.bin
 sysupgrade -n -F /tmp/fw.bin
 ```
 
-> **擦空是必须的。** `sysupgrade` 第一步是 `ubiattach`，分区里有旧数据（ECC 不兼容）
-> 会直接报错中止，根本走不到格式化。擦空后日志出现
-> `empty MTD device detected` 才会继续。
+> **⚠️ 必须先擦空两个分区。** `sysupgrade` 第一步是 `ubiattach`，
+> 分区里有旧数据（ECC 不兼容）会直接报错中止，根本走不到格式化。
+> 擦空后日志出现 `empty MTD device detected` 才会继续。
 
-### 7.5 修启动标志
+### 8.5 验证安装
 
-`sysupgrade` 内部的 `fw_setenv flag_boot_rootfs 0` 会失败
-（日志里 `Warning: Bad CRC, using default environment`），必须在 U-Boot 里补：
+```sh
+mount | head -1
+# /dev/root on /rom type squashfs      ← 不是 tmpfs
 
+df -h | grep overlay
+# /dev/ubi0_1  60.4M  →  /overlay
+
+fw_printenv flag_boot_rootfs
+# flag_boot_rootfs=0
+
+ubus call system board
+# "rootfs_type": "squashfs"
 ```
-setenv flag_boot_rootfs 0
-setenv flag_last_success 0
-setenv flag_boot_success 1
-setenv flag_try_sys1_failed 0
-setenv flag_try_sys2_failed 0
-saveenv
-reset
+
+### 8.6 装 LuCI（**不需要 WAN**）
+
+路由器没接 WAN 也能装 —— 用电脑做反向代理：
+
+```bash
+# 电脑上（需要有外网）
+python tools/_apkproxy.py 8000
 ```
 
-### 7.6 成功标志
-
+```sh
+# 路由器上（PC_IP = 电脑以太网 IP）
+sed -i 's|https://downloads.openwrt.org|http://<PC_IP>:8000|g' \
+    /etc/apk/repositories.d/distfeeds.list
+apk update          # OK: 11310 distinct packages available
+apk add luci
+apk add uhttpd-mod-ucode      # ← 必须！见 8.7
 ```
-$ mount | head -1
-/dev/root on /rom type squashfs (ro,relatime,errors=continue)     ← 不是 tmpfs
 
-$ df -h | grep -E 'rom|overlay'
-/dev/root    8.5M  8.5M  0  100%  /rom
-/dev/ubi0_1  60.4M 72.0K 57.2M  0%  /overlay
-overlayfs:/overlay  60.4M 72.0K 57.2M 0%  /
+> ⚠️ **端口冲突**：如果电脑上同时跑着 `python -m http.server 8000`，
+> 会和代理抢端口，导致 `wget: exited with error 8`。只留一个。
 
-$ ubus call system board
-{
-  "kernel": "6.18.60",
-  "model": "Xiaomi Redmi AX5400",
-  "board_name": "xiaomi,redmi-ax5400",
-  "rootfs_type": "squashfs"
-}
+### 8.7 LuCI 403 的两个坑
 
-$ fw_printenv flag_boot_rootfs
-flag_boot_rootfs=0
+装完 LuCI 后访问 `/cgi-bin/luci/` 会返回 **403**，有两个原因：
 
-$ iwinfo
-phy0-ap0  ESSID: "OpenWrt"  Channel: 1  (2.412 GHz)  HE20
-phy1-ap0  ESSID: "OpenWrt"  Channel: 36 (5.180 GHz)  HE80
+**坑一：`/etc/config/uhttpd` 里还是旧的 Lua 路径**
+
+```sh
+uci show uhttpd.main | grep prefix
+# uhttpd.main.lua_prefix='/cgi-bin/luci=/usr/lib/lua/luci/sgi/uhttpd.lua'   ← 文件不存在
+```
+
+修复：
+
+```sh
+uci del uhttpd.main.lua_prefix
+uci add_list uhttpd.main.ucode_prefix='/cgi-bin/luci=/usr/share/ucode/luci/uhttpd.uc'
+uci commit uhttpd
+```
+
+**坑二：`uhttpd-mod-ucode` 不会自动装**
+
+它不是 `luci` 的依赖。没装时：
+
+- `/usr/lib/uhttpd_ucode.so` 不存在
+- `ps | grep uhttpd` 看不到 `-o /cgi-bin/luci -O ...` 参数
+
+```sh
+apk add uhttpd-mod-ucode
+/etc/init.d/uhttpd restart
+ps w | grep '[u]httpd'
+# 应该看到：-o /cgi-bin/luci -O /usr/share/ucode/luci/uhttpd.uc
+```
+
+**验证成功：**
+
+```bash
+curl -s -o /tmp/t.html -w "%{http_code} %{size_download}\n" http://192.168.1.1/cgi-bin/luci/
+# → 403 2797          ← 403 是正常的！LuCI 对未登录请求返回 403 + 登录页
+
+grep -o 'luci_username' /tmp/t.html     # 有登录表单就是成功
+```
+
+### 8.8 收尾
+
+```sh
+passwd root                      # 设密码（空密码会被 dropbear 拒绝）
+uci set wireless.radio0.disabled=0
+uci set wireless.radio1.disabled=0
+uci set wireless.default_radio0.disabled=0
+uci set wireless.default_radio1.disabled=0
+uci commit wireless && wifi reload
 ```
 
 ---
 
-## 8. 救砖兜底：官方恢复模式
+## 9. 救砖兜底：官方恢复模式
 
 任何一步失败都能用这个回到原厂：
 
 1. 电脑以太网设静态 `192.168.31.100/24`，**不设网关**
-   （设了网关会抢默认路由，导致电脑断网）
-2. `python tools/_recovery.py <官方固件.bin>`
-   （DHCP:67 + TFTP:69，option 66/67 都填）
+2. `python tools/_recovery.py <官方固件.bin>`（DHCP:67 + TFTP:69，自动回 option 66/67）
 3. 路由器：按住 Reset → 插电 → 按 20 秒 → 松开
 4. 它会自己 `ping` → `dhcp` → `tftp` → `xq_flash_erase` → `Upgrade success!`
 
@@ -431,30 +466,6 @@ phy1-ap0  ESSID: "OpenWrt"  Channel: 36 (5.180 GHz)  HE80
 > 中途打断会导致 `dhcp failed, retry` 反复重试。
 
 刷完可能卡住（串口无声、网口有 link 但不发包），**再断一次电**即可正常启动。
-
----
-
-## 9. 没有 WAN 口时如何装软件包
-
-路由器没有默认路由（WAN 未接），但电脑能上网。在电脑上跑反向代理，
-把路由器的 apk 请求转发到 downloads.openwrt.org：
-
-```bash
-python tools/_apkproxy.py 8000
-```
-
-```sh
-# 路由器上
-sed -i 's|https://downloads.openwrt.org|http://<PC_IP>:8000|g' \
-    /etc/apk/repositories.d/distfeeds.list
-apk update        # OK: 11312 distinct packages available
-apk add <pkg>
-```
-
-> ⚠️ **注意版本匹配**：snapshot 是滚动更新的，旧固件装新包会出问题。
-> 实测 `apk add luci` 能装成功，但 `/cgi-bin/luci/` 返回 403 ——
-> 因为 LuCI 在这两个版本之间从 **Lua 迁到了 ucode**，接口对不上。
-> 想要 Web 界面，建议直接用**自带 LuCI 的稳定版镜像**（如 24.10.x）再打 ECC 补丁。
 
 ---
 
@@ -485,16 +496,13 @@ apk add <pkg>
 
 **不要用 `/proc/mtd` 累加推算偏移！**
 
-我一开始就是这么算的，结果漏掉了 `crash_syslog`（`0xA00000`，`0x80000`），
-导致 `rootfs` 的偏移算成 `0xAA0000` 而不是 `0xA80000` —— **正好错 512KB**。
-
+我一开始就是这么算的，漏掉了 `crash_syslog`（`0xA00000`，`0x80000`），
+导致 `rootfs` 偏移算成 `0xAA0000` 而不是 `0xA80000` —— **正好错 512KB**。
 写进去的数据完全错位，刷完还是砖，而且看起来像"固件有问题"。
 
-**一定要用 `smeminfo` 读真实偏移**（U-Boot 里执行 `smeminfo`）。
+**一定要用 `smeminfo` 读真实偏移。**
 
 ### 10.3 OpenWrt 的分区重映射
-
-OpenWrt 的 DTS 会重新划分：
 
 | OpenWrt 分区名 | 偏移 | 大小 |
 |---|---|---|
@@ -502,27 +510,34 @@ OpenWrt 的 DTS 会重新划分：
 | `rootfs` | `0x2E80000` | 81.5 MiB（到 NAND 末尾） |
 
 内核 cmdline：`ubi.mtd=rootfs root=/dev/ubiblock0_0`
-
-→ **内核在 mtd18（`ubi_kernel`），rootfs 在 mtd19（`rootfs`），`flag_boot_rootfs=0`**
-
-这和 `platform.sh` 里的定义一致：
-
-```sh
-xiaomi,redmi-ax5400)
-    fw_setenv flag_boot_rootfs 0
-    fw_setenv flag_last_success 0
-    fw_setenv flag_boot_success 1
-    fw_setenv flag_try_sys1_failed 8
-    fw_setenv flag_try_sys2_failed 8
-    CI_KERN_UBIPART="ubi_kernel"     # 内核
-    CI_ROOT_UBIPART="rootfs"         # rootfs
-    CI_DATA_UBIPART="rootfs"
-    nand_do_upgrade "$1"
-```
+→ 内核在 mtd18，rootfs 在 mtd19，`flag_boot_rootfs=0`
 
 ---
 
-## 11. 工具清单
+## 11. 踩坑清单（速查）
+
+| # | 坑 | 现象 | 解决 |
+|---|---|---|---|
+| 1 | **分区偏移算错** | 刷完还是砖，看起来像固件问题 | 用 `smeminfo` 而不是累加 `/proc/mtd` |
+| 2 | **ECC 8-bit vs 芯片 OOB 64** | `ubi_io_read: error -74 (ECC error)` | 改 DTB 的 `nand-ecc-strength` 为 4 |
+| 3 | **sysupgrade 假成功** | 报 `successful` 但起不来 | 写和读用的是不同 ECC 的程序 |
+| 4 | **分区里有旧数据** | `ubi_attach_mtd_dev: failed to attach, error -22` | 先 `mtd erase` 两个分区 |
+| 5 | **`flag_boot_rootfs` 被覆盖** | 设了 1 但启动还是 `rootfs 0` | 把 initramfs 写到 mtd18（槽 0）绕开 |
+| 6 | **Reset 按 12 秒不够** | 只有 `detect button press`，没有 `pressed 5 secs` | 按 **20 秒** |
+| 7 | **sysupgrade 元数据丢失** | `Image metadata not present` | 别重打包 tar；或加 `-F` |
+| 8 | **恢复模式看起来卡住** | `Trying to ping server.....` 不动 | 别 Ctrl-C，它在重试，会走通 |
+| 9 | **静态 IP 设了网关** | 电脑断网（默认路由被抢） | 静态 IP **不设网关** |
+| 10 | **重打包 sysupgrade** | 元数据 `FWx0` 丢失 | 用 tarfile 等长覆写内核 |
+| 11 | **LuCI 403：lua_prefix** | `/cgi-bin/luci/` 返回 403 | 改成 `ucode_prefix` |
+| 12 | **LuCI 403：缺 uhttpd-mod-ucode** | uhttpd 启动参数没有 `-o/-O` | `apk add uhttpd-mod-ucode` |
+| 13 | **端口 8000 冲突** | `wget: exited with error 8` | HTTP 服务器和代理不能同时占 8000 |
+| 14 | **固件与软件包版本不匹配** | LuCI 装上了但 ucode 处理器崩溃/挂住 | 刷**当前** snapshot，让固件和包同版本 |
+| 15 | **SSH 空密码被拒** | `User 'root' has blank password, rejected` | 先 `passwd root` 设密码 |
+| 16 | **断电时间太短** | 串口无输出、网口有 link 但不发包 | 断电等 **10 秒** |
+
+---
+
+## 12. 工具清单
 
 | 工具 | 用途 |
 |---|---|
@@ -549,7 +564,7 @@ pip install pyserial paramiko
 
 ---
 
-## 12. 常见问题
+## 13. 常见问题
 
 **Q: 怎么判断我手上的 RA74 是哪种芯片？**
 
@@ -562,13 +577,27 @@ Device Size:128 MiB, Page size:2048, Spare Size:64, ECC:4-bit
 ```
 
 或者从运行中的 OpenWrt：`dmesg | grep -i "OOB size"`
+
 - `OOB size: 64` → **ESMT 芯片，必须打补丁**
 - `OOB size: 128` → GigaDevice，原版固件直接可用
 
-**Q: 打了补丁之后，还能用原厂固件吗？**
+**Q: 以后刷新固件（ImmortalWrt 等）还要打补丁吗？**
 
-可以。补丁只改 OpenWrt 镜像里的 DTB，不影响 U-Boot 和原厂固件。
-想回原厂随时走恢复模式。
+**要。** 每个镜像的 DTB 里都是 `nand-ecc-strength = 8`，
+不打补丁刷进去就会变砖。流程：下载 → `_ubipatch.py` / `_fitpatch.py` → LuCI 上传刷写。
+
+**Q: 长按 Reset 能进 OpenWrt 的 initramfs 吗？**
+
+不能。长按 Reset 进的是**小米官方恢复**（`xq_upgrade`），它只认小米格式的 `.bin`，
+而且会校验文件头。OpenWrt 的 initramfs 是手动 `nand write` 进去的临时安装器。
+
+刷 OpenWrt 固件请用 **LuCI → 系统 → 备份/刷写固件**。
+
+**Q: 系统搞坏了怎么办？**
+
+- 配置坏了：LuCI 里"恢复出厂设置"，或 SSH 删 overlay 文件
+- 完全起不来：走第 9 节的恢复模式，或第 8 节的 U-Boot + TFTP 流程
+- squashfs 根文件系统是只读的，永远不会被改坏，所有改动都在 overlay 里
 
 **Q: 为什么不直接改 U-Boot 的 ECC？**
 
@@ -577,14 +606,14 @@ U-Boot 的 ECC 是跟着芯片自动选的（OOB 64 → 4-bit），已经是对�
 
 **Q: 为什么不用 ImageBuilder 重新打包？**
 
-ImageBuilder 不能改 DTS/DTB，只能选包。要改 ECC 必须动设备树，得用完整 buildroot 编译 ——
+ImageBuilder 不能改 DTS/DTB，只能选包。要改 ECC 必须动设备树 ——
 而本文的方案连编译都不需要。
 
 ---
 
-## 13. 免责声明
+## 14. 免责声明
 
-刷机有风险。本文流程已在 **RA74 / ESMT F50D1G41LB / OOB 64** 上验证通过，
+刷机有风险。本文流程已在 **RA74 / ESMT F50D1G41LB / OOB 64** 上完整验证通过，
 但不同批次硬件可能仍有差异。
 
 **操作前务必备份全部分区**（`dd if=/dev/mtdN of=...`），并确认手上有可用的官方固件用于恢复。
